@@ -3,11 +3,17 @@ fn main() {
 }
 
 use pnet::datalink;
-use pnet::packet::ipv4::Ipv4Packet;
-use pnet::packet::Packet;
+use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
+use pnet::packet::{MutablePacket, Packet};
 use byteorder::{BigEndian, ByteOrder};
 use pnet::datalink::MacAddr;
+use pnet::packet::arp::{ArpHardwareTypes, ArpOperations, ArpPacket};
 use pnet::packet::ethernet::{EthernetPacket, EtherTypes, MutableEthernetPacket};
+use pnet::packet::icmp::{echo_reply, echo_request, IcmpPacket, IcmpTypes};
+use pnet::packet::ip::IpNextHeaderProtocols;
+use pnet::util::checksum;
+use pnet::transport::{icmp_packet_iter, transport_channel};
+use pnet::transport::TransportChannelType::Layer3;
 
 
 /**
@@ -80,6 +86,9 @@ fn test03() {
     println!();
 }
 
+/**
+构建数据帧
+ */
 #[test]
 fn test04() {
     // 创建一个MutableEthernetPacket对象
@@ -98,6 +107,9 @@ fn test04() {
     println!("以太网类型: {:?}", ethernet_packet.get_ethertype());
 }
 
+/**
+解析数据帧
+ */
 #[test]
 fn test05() {
     let data: [u8; 14] = [
@@ -112,4 +124,133 @@ fn test05() {
     println!("源MAC地址: {:?}", source_mac);
     println!("目标MAC地址: {:?}", destination_mac);
     println!("以太网类型: {:?}", ethertype);
+}
+
+#[test]
+fn test06() {
+    // 获取网络接口
+    let interface_name = "eth0";
+    let interfaces = datalink::interfaces();
+    let interface = interfaces
+        .into_iter()
+        .find(|iface| iface.name == interface_name)
+        .expect("Failed to find network interface");
+
+    // 构建ARP请求包
+    let source_mac = MacAddr::zero();
+    let source_ip = [192, 168, 0, 1];
+    let target_ip = [192, 168, 0, 2];
+    let mut buffer = [0u8; 42];
+    let mut ethernet_packet = EthernetPacket::new(&mut buffer[..]).unwrap();
+    ethernet_packet.set_destination(MacAddr::broadcast());
+    ethernet_packet.set_source(source_mac);
+    ethernet_packet.set_ethertype(EtherTypes::Arp);
+
+    let mut arp_buffer = [0u8; 28];
+    let mut arp_packet = ArpPacket::new(&mut arp_buffer).unwrap();
+    arp_packet.set_hardware_type(ArpHardwareTypes::Ethernet);
+    arp_packet.set_protocol_type(EtherTypes::Ipv4);
+    arp_packet.set_hw_addr_len(6);
+    arp_packet.set_proto_addr_len(4);
+    arp_packet.set_operation(ArpOperations::Request);
+    arp_packet.set_sender_hw_addr(source_mac);
+    arp_packet.set_sender_proto_addr(source_ip);
+    arp_packet.set_target_hw_addr(MacAddr::zero());
+    arp_packet.set_target_proto_addr(target_ip);
+
+    ethernet_packet.set_payload(arp_packet.packet_mut());
+
+    // 发送ARP请求包
+    let (mut tx, _) = match datalink::channel(&interface, Default::default()) {
+        Ok(datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
+        Ok(_) => panic!("Unsupported channel type"),
+        Err(e) => panic!("Failed to create channel: {}", e),
+    };
+    tx.send_to(ethernet_packet.packet(), None).expect("Failed to send packet");
+
+    // 接收ARP响应包
+    let mut rx_buffer = [0u8; 1500];
+    loop {
+        match tx.recv_from(&mut rx_buffer) {
+            Ok((size, _)) => {
+                let ethernet_packet = EthernetPacket::new(&rx_buffer[..size]).unwrap();
+                if ethernet_packet.get_ethertype() == EtherTypes::Arp {
+                    let arp_packet = ArpPacket::new(ethernet_packet.payload()).unwrap();
+                    if arp_packet.get_operation() == ArpOperations::Reply
+                        && arp_packet.get_target_proto_addr() == source_ip
+                    {
+                        println!("Received ARP reply: {:?}", arp_packet);
+                        break;
+                    }
+                }
+            }
+            Err(e) => panic!("Failed to receive packet: {}", e),
+        }
+    }
+}
+
+#[test]
+fn test07() {
+    // 获取网络接口
+    let interface_name = "eth0";
+    let interfaces = datalink::interfaces();
+    let interface = interfaces
+        .into_iter()
+        .find(|iface| iface.name == interface_name)
+        .expect("Failed to find network interface");
+
+    // 构建ICMP请求包
+    let source_ip = [192, 168, 0, 1];
+    let target_ip = [192, 168, 0, 2];
+    let mut buffer = [0u8; 42];
+    let mut ipv4_packet = MutableIpv4Packet::new(&mut buffer[..]).unwrap();
+    ipv4_packet.set_version(4);
+    ipv4_packet.set_header_length(5);
+    ipv4_packet.set_total_length(42);
+    ipv4_packet.set_identification(0);
+    ipv4_packet.set_ttl(64);
+    ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Icmp);
+    ipv4_packet.set_source(source_ip.into());
+    ipv4_packet.set_destination(target_ip.into());
+
+    let mut icmp_buffer = [0u8; 8];
+    let mut icmp_packet = echo_request::MutableEchoRequestPacket::new(&mut icmp_buffer).unwrap();
+    icmp_packet.set_icmp_type(IcmpTypes::EchoRequest);
+    icmp_packet.set_identifier(0);
+    icmp_packet.set_sequence_number(0);
+    icmp_packet.set_payload(b"Hello ICMP");
+
+    let checksum = checksum(&icmp_packet.packet(), 1);
+    icmp_packet.set_checksum(checksum);
+
+    ipv4_packet.set_payload(icmp_packet.packet_mut());
+
+    // 发送ICMP请求包
+    let (mut tx, _) = match datalink::channel(&interface, Default::default()) {
+        Ok(datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
+        Ok(_) => panic!("Unsupported channel type"),
+        Err(e) => panic!("Failed to create channel: {}", e),
+    };
+    tx.send_to(ipv4_packet.packet(), None)
+        .expect("Failed to send packet");
+
+    // 接收ICMP响应包
+    let mut rx_buffer = [0u8; 1500];
+    loop {
+        match tx.recv_from(&mut rx_buffer) {
+            Ok((size, _)) => {
+                let ipv4_packet = Ipv4Packet::new(&rx_buffer[..size]).unwrap();
+                if ipv4_packet.get_next_level_protocol() == IpNextHeaderProtocols::Icmp {
+                    let icmp_packet = echo_reply::EchoReplyPacket::new(ipv4_packet.payload()).unwrap();
+                    if icmp_packet.get_icmp_type() == IcmpTypes::EchoReply
+                        && icmp_packet.get_destination_ip() == source_ip
+                    {
+                        println!("Received ICMP reply: {:?}", icmp_packet);
+                        break;
+                    }
+                }
+            }
+            Err(e) => panic!("Failed to receive packet: {}", e),
+        }
+    }
 }
